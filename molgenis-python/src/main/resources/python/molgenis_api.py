@@ -12,7 +12,8 @@ import security
 import timeit
 import time
 import logging
-import ConfigParser
+from datetime import datetime
+import copy
 
 class Connect_Molgenis():
     """Some simple methods for adding, updating and retrieving rows from Molgenis though the REST API
@@ -34,17 +35,22 @@ class Connect_Molgenis():
         connection.update_entity_row('public_rnaseq_Individuals',[{'field':'id', 'operator':'EQUALS', 'value':'John Doe'}], {'gender':'Female'})  
     """
 
-    def __init__(self, server_url, new_pass_file = True,log_file = 'molgenis.log', logging_level='DEBUG', logfile_mode = 'w'):
+    def __init__(self, server_url, new_pass_file = True,log_file = 'molgenis.log', logging_level='DEBUG', logfile_mode = 'w', only_warn_duplicates=False):
         '''Initialize Python api to talk to Molgenis Rest API
         
         Args:
-            server_url (string): The url to the molgenis server (ex: https://molgenis39.target.rug.nl/)
-            user (string):       Login username
-            password (string):   Login password
+            server_url (string):         The url to the molgenis server (ex: https://molgenis39.target.rug.nl/)
+            user (string):               Login username
+            password (string):           Login password
+            log_file (string):           Path to write logfile with debug info etc to (def: molgenis.log)
+            logging_level (string):      The level of logging to use. See Python's `logging` manual for info on levels (def: DEBUG)
+            logfile_mode (string):       Mode of writing to logfile, e.g. w for overwrite or a for append, see `logging` manual for more details (def: w)
+            only_warn_duplicates (bool): If set to true, throw warning instead of exception when trying to add duplicate values into unique column (def: False)
         '''
-        logging.basicConfig(level=getattr(logging, logging_level), filename = log_file, filemode = logfile_mode)
+        logging.basicConfig(filename = log_file, filemode = logfile_mode)
         logging.getLogger().addHandler(logging.StreamHandler())
         self.logger = logging.getLogger(__name__)
+        self.logger.setLevel(level=getattr(logging, logging_level))
         self.login_time = None 
         if new_pass_file:
             security.remove_secrets_file()
@@ -56,7 +62,8 @@ class Connect_Molgenis():
         self.column_meta_data = {}
         self.added_rows = 0
         self.time = None
-    
+        self.only_warn_duplicates = only_warn_duplicates
+        
     def _construct_login_header(self):
         '''Log in to the molgenis server and use the retrieve loginResponse token to construct the login header.
          
@@ -167,8 +174,42 @@ class Connect_Molgenis():
         if entity_id_attribute in data and self.get_column_meta_data(entity_name,entity_id_attribute)['auto']:
             self.logger.warning('The ID attribute ('+entity_id_attribute+') of the entity ('+entity_name+') you are adding a row to is set to `auto`.\n'\
                          +'The value you gave for id ('+str(data[entity_id_attribute])+') will not be used. Instead, the ID will be a random string.')
-        
-    def add_entity_row(self, entity_name, data, validate_json=False):
+
+    def _sanitize_data(self, data, add_datetime, datetime_column, added_by, added_by_column):
+        if add_datetime:
+            data[datetime_column] = str(datetime.now())
+        if added_by:
+            data[added_by_column] = security.retrieve('Username')
+        # make all values str and remove if value is None or empty string
+        data = {k: v for k, v in data.items() if v!=None}
+        data = dict([a, str(x)] for a, x in data.iteritems() if len(str(x).strip())>0)
+        return data
+    
+    def add_entity_row_or_file_server_response(self, entity_name, data, server_response):
+        try:
+            self.check_server_response(server_response, time.strftime('%H:%M:%S', time.gmtime(timeit.default_timer()-self.login_time))+ ' - Add row to entity '+entity_name, entity_used=entity_name, data_used=json.dumps(data))
+            added_id = server_response.headers['location'].split('/')[-1]
+        except Exception as e:
+            if self.only_warn_duplicates:
+                if 'Duplicate value' in str(e):
+                    message = 'Duplicate value not added, instead return id of already existing row\n'
+                    message += 'Tried to insert into '+str(entity_name)+' with data:\n'+str(data)
+                    self.logger.debug(message)
+                    unqiue_att = re.search("Duplicate value '(\S+?)' for unique attribute '(\S+?)'", str(e))
+                    row = self.query_entity_rows(entity_name, query = [{'field':unqiue_att.group(2), 'operator':'EQUALS', 'value':unqiue_att.group(1)}])['items'][0]
+                    try:
+                        added_id = row[self.get_id_attribute(entity_name)]
+                    except KeyError:
+                        print row
+                        raise
+                    self.logger.debug('id found for row with duplicate value: '+str(added_id))
+                else:
+                    raise
+        return added_id  
+      
+    _add_datetime_default = False
+    _added_by_default = False
+    def add_entity_row(self, entity_name, data, validate_json=False, add_datetime=None, datetime_column='datetime_added', added_by=None, added_by_column='added_by'):
         '''Add a row to an entity
         
         Args:
@@ -176,35 +217,46 @@ class Connect_Molgenis():
             json_data (dict): Key = column name, value = column value
             validate_json (bool): If True, check if the given data keys correspond with the column names of entity_name.
                               If adding entity rows seems slow, try setting to False (def: False)
-                              
+            add_datetime (bool): If True, add a datetime to the column <datetime_column> (def: False)
+            datetime_column (str): column name where to add datetime
+            added_by (bool): If true, add the login name of the person that updated the record
+            added_by_column (string): column name where to add name of person that updated record
+            
         Returns:
             added_id (string): Id of the row that got added
         '''
+        if not add_datetime:
+            add_datetime = self._add_datetime_default
+        if not added_by:
+            added_by = self._added_by_default
         if timeit.default_timer()-self.login_time > 30*60:
+            # molgenis login head times out after a certain time, so after 30 minutes resend login request
             self.headers = self._construct_login_header()
         # make a string of json data (dictionary) with key=column name and value=value you want (works for 1 individual, Jonatan is going to find out how to to it with multiple)
         # post to the entity with the json data
         if validate_json:
             self.validate_data(entity_name, data)
-        # make all values str and remove if value is None
-        data = {k: v for k, v in data.items() if v!=None}
-        data = dict([a, str(x)] for a, x in data.iteritems() if len(str(x).strip())>0)
+        data = self._sanitize_data(data, add_datetime, datetime_column, added_by, added_by_column)
         request_url = self.api_url+'/'+entity_name+'/'
         server_response = requests.post(request_url, data=json.dumps(data), headers=self.headers)
         self.added_rows += 1
-        self.check_server_response(server_response, time.strftime('%H:%M:%S', time.gmtime(timeit.default_timer()-self.login_time))+ ' - Add row to entity '+entity_name, entity_used=entity_name, data_used=json.dumps(data))
-        added_id = server_response.headers['location'].split('/')[-1]
+        added_id = self.add_entity_row_or_file_server_response(entity_name, data, server_response)
         return added_id
     
-    def add_file(self, file_path, description, entity, file_name=None):
+    def add_file(self, file_path, description, entity_name, extra_data=None, file_name=None, add_datetime=False, datetime_column='datetime_added', added_by=None, added_by_column='added_by'):
         '''Add a file to entity File.
         
         Args:
             file_path (string): Path to the file to be uploaded
             description (description): Description of the file
             entity (string): Name of the entity to add the files to
+            data (dict): If extra columns have to be added, provide a dict with key column name, value value (def: None)
             file_name (string): Name of the file. If None is set to basename of filepath (def: None)
-        
+            added_by (bool): If true, add the login name of the person that updated the record (def: False)
+            added_by_column (string): column name where to add name of person that updated record (def: added_by)
+            add_datetime (bool): If true, add the datetime that the file was added (def: False)
+            add_datetime_column (string): column name where to add datetime (def: datetime_added)
+            
         Returns:
             file_id (string): ID if the file that got uploaded (for xref)
             
@@ -214,20 +266,27 @@ class Connect_Molgenis():
             >>> print connection.add_file('/Users/Niek/UMCG/test/data/ATACseq/rundir/QC/FastQC_0.sh')
             AAAACTWVCYDZ6YBTJMJDWXQAAE
         '''
+        if not add_datetime:
+            add_datetime = self._add_datetime_default
+        if not added_by:
+            added_by = self._added_by_default
         if not file_name:
             file_name = os.path.basename(file_path)
         if not os.path.isfile(file_path):
             self.logger.error('File not found: '+str(file_path))
             raise IOError('File not found: '+str(file_path))
-        file_post_header = self.headers
+        file_post_header = copy.deepcopy(self.headers)
         del(file_post_header['Accept'])
         del(file_post_header['Content-type'])
-        server_response = requests.post(self.api_url+'/'+entity, 
+        data = {'description': description}
+        if extra_data:
+            data.update(extra_data)
+        data = self._sanitize_data(data, add_datetime, datetime_column, added_by, added_by_column)
+        server_response = requests.post(self.api_url+'/'+entity_name, 
                                         files={'attachment':(os.path.basename(file_path), open(file_path,'rb'))},
-                                        data={'description': description},
+                                        data=data,
                                         headers = file_post_header)
-        self.check_server_response(server_response,'Upload file',data_used = str(file_path))
-        added_id = server_response.headers['location'].split('/')[-1]
+        added_id = self.add_entity_row_or_file_server_response(entity_name, data, server_response)
         return added_id
         
     def query_entity_rows(self, entity_name, query):
@@ -277,39 +336,49 @@ class Connect_Molgenis():
                         +str(int(server_response_json['num'])-int(server_response_json['total']))+' rows will not be in the results.')
             self.logger.info('Selected '+str(server_response_json['total'])+' row(s).')
         return server_response_json
-
-    def update_entity_rows(self, entity_name, query, data):
+    _updated_by_default = False
+    def update_entity_rows(self, entity_name, query, data, add_datetime=None, datetime_column='datetime_last_updated', updated_by = None, updated_by_column='updated_by'):
         '''Update an entity row
     
         Args:
             entity_name (string): Name of the entity to update
             query (list): List of dictionaries which contain query to select the row to update (see documentation of query_entity_rows)
             data (dict):  Key = column name, value = column value
+            updated_by (bool): If true, add the login name of the person that updated the record
+            updated_by_column (string): column name where to add name of person that updated record
         '''
+        if not add_datetime:
+            add_datetime = self._add_datetime_default
+        if not updated_by:
+            updated_by = self._updated_by_default
         self.validate_data(entity_name, data)
         entity_data = self.query_entity_rows(entity_name, query)
         if len(entity_data['items']) == 0:
             self.logger.error('Query returned 0 results, no row to update.')
             raise Exception('Query returned 0 results, no row to update.')
+        data = self._sanitize_data(data, add_datetime, datetime_column, updated_by, updated_by_column)
         id_attribute = self.get_id_attribute(entity_name)
         server_response_list = [] 
         for entity_items in entity_data['items']:
             row_id = entity_items[id_attribute]
-            if len(data) == 1:
-                server_response = requests.put(self.api_url+'/'+entity_name+'/'+row_id+'/'+data.keys()[0], data=data[data.keys()[0]], headers=self.headers)
+            for key in data:
+                server_response = requests.put(self.api_url+'/'+entity_name+'/'+str(row_id)+'/'+key, data='"'+str(data[key])+'"', headers=self.headers)
                 server_response_list.append(server_response)
-                self.check_server_response(server_response, 'Update entity row (single value)', query_used=query,data_used=data,entity_used=entity_name)
-            else:
-                self.logger.error('Updating multiple values at the same time not implemented yet')
-                raise NotImplementedError('Updating multiple values at the same time not implemented yet')
+                self.check_server_response(server_response, 'Update entity row', query_used=query,data_used=[self.api_url+'/'+entity_name+'/'+str(row_id)+'/'+key, '"'+str(data[key])+'"'],entity_used=entity_name)                
+            # BELOW IS LEGACY CODE
+            #else:
+            #    self.logger.error('Updating multiple values at the same time not implemented yet'
+            #                     +'Trying to update following data:\n'+str(data))
+            #    raise NotImplementedError('Updating multiple values at the same time not implemented yet'
+            #                             +'Trying to update following data:\n'+str(data))
                 # if trying to update multiple columns, column values that are not given will be overwritten with null, so we need to add the existing column data into our dict
                 # DOES NOT WORK FOR X/MREFS!!!
-                for key in entity_items:
-                    if key != id_attribute and key not in data and key!='previous_individuals':
-                        data[key.encode('ascii')] = str(entity_items[key]).encode('ascii')
-                server_response = requests.put(self.api_url+'/'+entity_name+'/'+row_id+'/', data=json.dumps(data), headers=self.headers)
-                server_response_list.append(server_response)
-                self.check_server_response(server_response, 'Update entity row (multiple values)', query_used=query,data_used=data,entity_used=entity_name)
+            #   for key in entity_items:
+            #        if key != id_attribute and key not in data and key!='previous_individuals':
+            #            data[key.encode('ascii')] = str(entity_items[key]).encode('ascii')
+            #    server_response = requests.put(self.api_url+'/'+entity_name+'/'+row_id+'/', data=json.dumps(data), headers=self.headers)
+            #    server_response_list.append(server_response)
+            #    self.check_server_response(server_response, 'Update entity row (multiple values)', query_used=query,data_used=data,entity_used=entity_name)
         return server_response_list
 
     def get_entity_meta_data(self, entity_name):
@@ -429,7 +498,7 @@ class Connect_Molgenis():
         id_attribute = self.get_id_attribute(entity_name)
         for rows in entity_data['items']:
             row_id = rows[id_attribute]
-            server_response = requests.delete(self.api_url+'/'+entity_name+'/'+row_id+'/', headers=self.headers)
+            server_response = requests.delete(self.api_url+'/'+entity_name+'/'+str(row_id)+'/', headers=self.headers)
             self.check_server_response(server_response, 'Delete entity row',entity_used=entity_name,query_used=query_used)
             server_response_list.append(server_response)
         return server_response_list
