@@ -55,7 +55,7 @@ public class MolgenisJsTest
 		Entity person = new MapEntity();
 		person.set("weight", 82);
 
-		Object weight = ScriptEvaluator.eval("$('weight').unit('kg').toUnit('pound').value()", person, emd);
+		Object weight = ScriptEvaluator.eval("$('weight').unit('kg').toUnit('poundmass').value()", person, emd);
 		assertEquals(weight, 180.7790549915996);
 	}
 
@@ -89,6 +89,15 @@ public class MolgenisJsTest
 
 		Object result = ScriptEvaluator.eval("$('gender').map({'20':'2'}, 'B2', 'B3').value()", new MapEntity(), emd);
 		assertEquals(result.toString(), "B3");
+	}
+
+	@Test
+	public void testTimes()
+	{
+		DefaultEntityMetaData emd = new DefaultEntityMetaData("person");
+		emd.addAttribute("height").setDataType(MolgenisFieldTypes.INT);
+		Object result = ScriptEvaluator.eval("$('height').times(100).value()", new MapEntity("height", 1.8), emd);
+		assertEquals(result, (double) 180);
 	}
 
 	@Test

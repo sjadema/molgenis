@@ -34,19 +34,19 @@ import org.molgenis.data.elasticsearch.index.EntityToSourceConverter;
 import org.molgenis.data.meta.EntityMetaDataMetaData;
 import org.molgenis.data.meta.MetaDataService;
 import org.molgenis.data.meta.MetaDataServiceImpl;
+import org.molgenis.data.settings.AppSettings;
 import org.molgenis.data.support.DataServiceImpl;
+import org.molgenis.data.support.OwnedEntityMetaData;
 import org.molgenis.data.transaction.TransactionLogIndexedRepositoryDecorator;
 import org.molgenis.data.transaction.TransactionLogRepositoryDecorator;
 import org.molgenis.data.transaction.TransactionLogService;
 import org.molgenis.data.validation.EntityAttributesValidator;
 import org.molgenis.data.validation.IndexedRepositoryValidationDecorator;
 import org.molgenis.data.validation.RepositoryValidationDecorator;
-import org.molgenis.data.version.MolgenisUpgradeService;
 import org.molgenis.file.FileStore;
+import org.molgenis.framework.MolgenisUpgradeService;
 import org.molgenis.framework.db.WebAppDatabasePopulator;
 import org.molgenis.framework.db.WebAppDatabasePopulatorService;
-import org.molgenis.framework.server.MolgenisSettings;
-import org.molgenis.framework.ui.MolgenisPluginController;
 import org.molgenis.framework.ui.MolgenisPluginRegistry;
 import org.molgenis.framework.ui.MolgenisPluginRegistryImpl;
 import org.molgenis.messageconverter.CsvHttpMessageConverter;
@@ -54,7 +54,6 @@ import org.molgenis.security.CorsInterceptor;
 import org.molgenis.security.core.MolgenisPermissionService;
 import org.molgenis.security.freemarker.HasPermissionDirective;
 import org.molgenis.security.freemarker.NotHasPermissionDirective;
-import org.molgenis.security.owned.OwnedEntityMetaData;
 import org.molgenis.security.owned.OwnedEntityRepositoryDecorator;
 import org.molgenis.ui.freemarker.LimitMethod;
 import org.molgenis.ui.menu.MenuMolgenisUi;
@@ -105,7 +104,7 @@ public abstract class MolgenisWebAppConfig extends WebMvcConfigurerAdapter
 	private final Logger LOG = LoggerFactory.getLogger(getClass());
 
 	@Autowired
-	private MolgenisSettings molgenisSettings;
+	private AppSettings appSettings;
 
 	@Autowired
 	private MolgenisPermissionService molgenisPermissionService;
@@ -204,13 +203,13 @@ public abstract class MolgenisWebAppConfig extends WebMvcConfigurerAdapter
 	@Bean
 	public MolgenisInterceptor molgenisInterceptor()
 	{
-		return new MolgenisInterceptor(resourceFingerprintRegistry(), molgenisSettings, environment);
+		return new MolgenisInterceptor(resourceFingerprintRegistry(), appSettings, environment);
 	}
 
 	@Bean
 	public MolgenisPluginInterceptor molgenisPluginInterceptor()
 	{
-		return new MolgenisPluginInterceptor(molgenisUi(), molgenisSettings);
+		return new MolgenisPluginInterceptor(molgenisUi(), molgenisPermissionService);
 	}
 
 	@Bean
@@ -357,20 +356,20 @@ public abstract class MolgenisWebAppConfig extends WebMvcConfigurerAdapter
 	@Bean
 	public MenuReaderService menuReaderService()
 	{
-		return new MenuReaderServiceImpl(molgenisSettings);
+		return new MenuReaderServiceImpl(appSettings);
 	}
 
 	@Bean
 	public MenuManagerService menuManagerService()
 	{
-		return new MenuManagerServiceImpl(menuReaderService(), molgenisSettings, molgenisPluginRegistry());
+		return new MenuManagerServiceImpl(menuReaderService(), appSettings, molgenisPluginRegistry());
 	}
 
 	@Bean
 	public MolgenisUi molgenisUi()
 	{
-		MolgenisUi molgenisUi = new MenuMolgenisUi(molgenisSettings, menuReaderService());
-		return new MolgenisUiPermissionDecorator(molgenisUi, molgenisPermissionService, molgenisSettings);
+		MolgenisUi molgenisUi = new MenuMolgenisUi(menuReaderService());
+		return new MolgenisUiPermissionDecorator(molgenisUi, molgenisPermissionService);
 	}
 
 	@Bean
@@ -401,8 +400,8 @@ public abstract class MolgenisWebAppConfig extends WebMvcConfigurerAdapter
 		SearchService localSearchService = embeddedElasticSearchServiceFactory.create(localDataService,
 				new EntityToSourceConverter());
 
-		List<EntityMetaData> metas = DependencyResolver.resolve(Sets.newHashSet(localDataService.getMeta()
-				.getEntityMetaDatas()));
+		List<EntityMetaData> metas = DependencyResolver
+				.resolve(Sets.newHashSet(localDataService.getMeta().getEntityMetaDatas()));
 
 		// Sort repos to the same sequence as the resolves metas
 		List<Repository> repos = Lists.newArrayList(localDataService);
@@ -438,15 +437,21 @@ public abstract class MolgenisWebAppConfig extends WebMvcConfigurerAdapter
 
 		addUpgrades();
 		boolean didUpgrade = upgradeService.upgrade();
-		if (!indexExists() || didUpgrade)
+		if (didUpgrade)
 		{
-			LOG.info("Reindexing repositories....");
+			LOG.info("Reindexing repositories due to MOLGENIS upgrade...");
+			reindex();
+			LOG.info("Reindexing done.");
+		}
+		else if (!indexExists())
+		{
+			LOG.info("Reindexing repositories due to missing Elasticsearch index...");
 			reindex();
 			LOG.info("Reindexing done.");
 		}
 		else
 		{
-			LOG.info("Index found. No need to reindex.");
+			LOG.debug("Elasticsearch index exists, no need to reindex.");
 		}
 		runAsSystem(() -> metaDataService().setDefaultBackend(getBackend()));
 	}
@@ -492,13 +497,15 @@ public abstract class MolgenisWebAppConfig extends WebMvcConfigurerAdapter
 							new IndexedRepositoryValidationDecorator(dataService(),
 									new IndexedRepositoryExceptionTranslatorDecorator(
 											new TransactionLogIndexedRepositoryDecorator(indexedRepos,
-													transactionLogService)), new EntityAttributesValidator()),
-							idGenerator), molgenisSettings);
+													transactionLogService)),
+									new EntityAttributesValidator()),
+							idGenerator), appSettings);
 				}
 
-				return new RepositorySecurityDecorator(new AutoValueRepositoryDecorator(
-						new RepositoryValidationDecorator(dataService(), new TransactionLogRepositoryDecorator(
-								repository, transactionLogService), new EntityAttributesValidator()), idGenerator));
+				return new RepositorySecurityDecorator(
+						new AutoValueRepositoryDecorator(new RepositoryValidationDecorator(dataService(),
+								new TransactionLogRepositoryDecorator(repository, transactionLogService),
+								new EntityAttributesValidator()), idGenerator));
 			}
 		};
 	}

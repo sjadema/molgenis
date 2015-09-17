@@ -3,6 +3,7 @@ package org.molgenis.data.validation;
 import java.io.IOException;
 import java.util.Arrays;
 import java.util.Iterator;
+import java.util.List;
 import java.util.Set;
 
 import org.apache.commons.io.IOUtils;
@@ -17,6 +18,9 @@ import org.molgenis.data.EntityMetaData;
 import org.molgenis.data.Query;
 import org.molgenis.data.Repository;
 import org.molgenis.data.RepositoryCapability;
+import org.molgenis.data.transaction.LockMetaData;
+import org.molgenis.data.transaction.MolgenisTransactionLogEntryMetaData;
+import org.molgenis.data.transaction.MolgenisTransactionLogMetaData;
 import org.molgenis.fieldtypes.FieldType;
 import org.molgenis.fieldtypes.MrefField;
 import org.molgenis.fieldtypes.XrefField;
@@ -28,6 +32,9 @@ import com.google.common.collect.Sets;
 
 public class RepositoryValidationDecorator implements Repository
 {
+	private static List<String> ENTITIES_THAT_DO_NOT_NEED_VALIDATION = Arrays.asList(
+			MolgenisTransactionLogMetaData.ENTITY_NAME, MolgenisTransactionLogEntryMetaData.ENTITY_NAME,
+			LockMetaData.ENTITY_NAME);
 	private final EntityAttributesValidator entityAttributesValidator;
 	private final DataService dataService;
 	private final Repository decoratedRepository;
@@ -76,6 +83,8 @@ public class RepositoryValidationDecorator implements Repository
 
 	private void validate(Iterable<? extends Entity> entities, boolean forUpdate)
 	{
+		if (ENTITIES_THAT_DO_NOT_NEED_VALIDATION.contains(getName())) return;
+
 		Set<ConstraintViolation> violations = null;
 		for (Entity entity : entities)
 		{
@@ -88,7 +97,7 @@ public class RepositoryValidationDecorator implements Repository
 
 		for (AttributeMetaData attr : getEntityMetaData().getAtomicAttributes())
 		{
-			if (attr.isUnique())
+			if (attr.isUnique() && !attr.isAuto())
 			{
 				violations = checkUniques(entities, attr, forUpdate);
 				if (!violations.isEmpty())
@@ -150,7 +159,6 @@ public class RepositoryValidationDecorator implements Repository
 					if ((value == null || (attr.getDataType() instanceof MrefField && !(((Iterable<Entity>) value)
 							.iterator().hasNext())))
 							&& !attr.isAuto()
-							&& (attr.getDefaultValue() == null)
 							&& mustDoNotNullCheck(getEntityMetaData(), attr, entity))
 					{
 						String message = String.format("The attribute '%s' of entity '%s' can not be null.",
@@ -170,9 +178,9 @@ public class RepositoryValidationDecorator implements Repository
 		// Do not validate if Questionnaire status is not SUBMITTED
 		if (EntityUtils.doesExtend(entityMetaData, "Questionnaire") && entity.get("status") != "SUBMITTED") return false;
 
-		// Do not validate is visibleExpression resolves to false
+		// Do not validate if visibleExpression resolves to false
 		if (StringUtils.isNotBlank(attr.getVisibleExpression())
-				&& !ValidationUtils.resolveBooleanExpression(attr.getVisibleExpression(), entity, entityMetaData, attr)) return false;
+				&& !ValidationUtils.resolveBooleanExpression(attr.getVisibleExpression(), entity, entityMetaData)) return false;
 
 		return true;
 	}
